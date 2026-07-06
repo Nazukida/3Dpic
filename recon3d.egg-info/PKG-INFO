@@ -1,0 +1,12 @@
+Metadata-Version: 2.4
+Name: recon3d
+Version: 0.1.0
+Summary: CPU-only 3D reconstruction pipeline with desktop viewer
+Requires-Python: >=3.11
+Description-Content-Type: text/markdown
+Requires-Dist: numpy>=2.4.6
+Requires-Dist: opencv-contrib-python>=4.13.0.92
+Requires-Dist: pillow>=12.2.0
+Requires-Dist: pyside6>=6.11.1
+Requires-Dist: scipy>=1.17.1
+Requires-Dist: tqdm>=4.68.3

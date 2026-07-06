@@ -1,0 +1,3 @@
+[console_scripts]
+recon3d = recon3d.run:main
+recon3d-gui = recon3d.gui.app:main

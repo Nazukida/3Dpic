@@ -1,0 +1,6 @@
+numpy>=2.4.6
+opencv-contrib-python>=4.13.0.92
+pillow>=12.2.0
+pyside6>=6.11.1
+scipy>=1.17.1
+tqdm>=4.68.3
