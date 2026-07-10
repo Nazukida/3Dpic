@@ -41,6 +41,9 @@ class PlyData:
     rgb: np.ndarray | None            # (N, 3) uint8 or None
     normals: np.ndarray | None        # (N, 3) float32 or None
     count: int
+    opacity: np.ndarray | None = None  # (N,) float32 in [0,1] or None
+    scale: np.ndarray | None = None    # (N,) float32 (avg radius) or None
+    is_gaussian: bool = False          # True if loaded from a 3DGS PLY
 
     @property
     def has_color(self) -> bool:
@@ -137,8 +140,43 @@ def _extract(struct_arr: np.ndarray, names_present: set[str],
     return None
 
 
+def _is_gaussian_splatting(vprops: list[tuple[str, str]]) -> bool:
+    """Detect if the PLY is a 3D Gaussian Splatting export.
+
+    3DGS PLYs store colour as spherical harmonics DC coefficients (f_dc_0/1/2)
+    and have opacity + scale properties, rather than conventional red/green/blue.
+    """
+    names = {p[0] for p in vprops}
+    return "f_dc_0" in names and "opacity" in names
+
+
+def _sigmoid(x: np.ndarray) -> np.ndarray:
+    """Numerically stable sigmoid for opacity activation."""
+    return np.where(x >= 0,
+                    1.0 / (1.0 + np.exp(-x)),
+                    np.exp(x) / (1.0 + np.exp(x)))
+
+
+def _sh_dc_to_rgb(dc0: np.ndarray, dc1: np.ndarray, dc2: np.ndarray) -> np.ndarray:
+    """Convert SH degree-0 (DC) coefficients to sRGB [0,255] uint8.
+
+    The SH DC basis constant is C0 = 0.28209479... The stored value is the
+    coefficient; the actual colour is ``coeff * C0 + 0.5``.
+    """
+    C0 = 0.28209479177387814
+    r = dc0 * C0 + 0.5
+    g = dc1 * C0 + 0.5
+    b = dc2 * C0 + 0.5
+    rgb = np.stack([r, g, b], axis=-1)
+    rgb = np.clip(rgb * 255.0, 0, 255).astype(np.uint8)
+    return rgb
+
+
 def read_ply(path: str, max_points: int | None = None) -> PlyData:
     """Load a PLY point cloud.
+
+    Automatically detects 3D Gaussian Splatting format (spherical harmonics
+    colour, opacity, scale) and converts to a renderable representation.
 
     ``max_points`` optionally caps the number of points via uniform striding
     (cheap, order-preserving) - useful as a guard for enormous files.
@@ -161,6 +199,30 @@ def read_ply(path: str, max_points: int | None = None) -> PlyData:
         else:
             xyz, rgb, nrm = _read_binary(f, vcount, vprops, big_endian)
 
+    # --- 3D Gaussian Splatting detection & conversion ---
+    is_gaussian = _is_gaussian_splatting(vprops)
+    opacity = None
+    scale = None
+
+    if is_gaussian:
+        # Re-read the structured data for GS-specific properties.
+        # We need the raw field values for f_dc, opacity, scale.
+        with open(path, "rb") as f:
+            _fmt, _vc, _vp, _elems = _read_header(f)
+            for name, cnt, eprops in _elems:
+                if name == "vertex":
+                    break
+                _skip_element(f, cnt, eprops, is_ascii, big_endian)
+
+            if not is_ascii:
+                gs_data = _read_gaussian_binary(f, vcount, vprops, big_endian)
+            else:
+                gs_data = _read_gaussian_ascii(f, vcount, vprops)
+
+        rgb = gs_data["rgb"]
+        opacity = gs_data["opacity"]
+        scale = gs_data["scale"]
+
     n = len(xyz)
     if max_points is not None and 0 < max_points < n:
         step = int(np.ceil(n / max_points))
@@ -168,13 +230,111 @@ def read_ply(path: str, max_points: int | None = None) -> PlyData:
         xyz = xyz[idx]
         rgb = rgb[idx] if rgb is not None else None
         nrm = nrm[idx] if nrm is not None else None
+        opacity = opacity[idx] if opacity is not None else None
+        scale = scale[idx] if scale is not None else None
 
     xyz = np.ascontiguousarray(xyz, dtype=np.float32)
     if rgb is not None:
         rgb = np.ascontiguousarray(rgb, dtype=np.uint8)
     if nrm is not None:
         nrm = np.ascontiguousarray(nrm, dtype=np.float32)
-    return PlyData(xyz=xyz, rgb=rgb, normals=nrm, count=len(xyz))
+    if opacity is not None:
+        opacity = np.ascontiguousarray(opacity, dtype=np.float32)
+    if scale is not None:
+        scale = np.ascontiguousarray(scale, dtype=np.float32)
+    return PlyData(xyz=xyz, rgb=rgb, normals=nrm, count=len(xyz),
+                   opacity=opacity, scale=scale, is_gaussian=is_gaussian)
+
+
+def _read_gaussian_binary(f, vcount, vprops, big_endian) -> dict:
+    """Extract 3DGS-specific fields (SH colour, opacity, scale) from binary."""
+    order = ">" if big_endian else "<"
+    fields = []
+    for name, ptype in vprops:
+        base = _PLY_TYPES.get(ptype)
+        if base is None:
+            raise PlyError(f"unknown property type '{ptype}'")
+        fields.append((name, order + base))
+    dt = np.dtype(fields)
+    data = np.fromfile(f, dtype=dt, count=vcount)
+    if len(data) < vcount:
+        vcount = len(data)
+
+    names = {p[0] for p in vprops}
+
+    # Colour from SH DC coefficients
+    rgb = None
+    if "f_dc_0" in names and "f_dc_1" in names and "f_dc_2" in names:
+        dc0 = data["f_dc_0"].astype(np.float64)
+        dc1 = data["f_dc_1"].astype(np.float64)
+        dc2 = data["f_dc_2"].astype(np.float64)
+        rgb = _sh_dc_to_rgb(dc0, dc1, dc2)
+
+    # Opacity (stored as inverse sigmoid)
+    opacity = None
+    if "opacity" in names:
+        raw_opacity = data["opacity"].astype(np.float64)
+        opacity = _sigmoid(raw_opacity).astype(np.float32)
+
+    # Scale (stored as log): average of the 3 axes gives a representative radius
+    scale = None
+    if "scale_0" in names and "scale_1" in names and "scale_2" in names:
+        s0 = np.exp(data["scale_0"].astype(np.float64))
+        s1 = np.exp(data["scale_1"].astype(np.float64))
+        s2 = np.exp(data["scale_2"].astype(np.float64))
+        scale = ((s0 + s1 + s2) / 3.0).astype(np.float32)
+
+    return {"rgb": rgb, "opacity": opacity, "scale": scale}
+
+
+def _read_gaussian_ascii(f, vcount, vprops) -> dict:
+    """Extract 3DGS-specific fields from ASCII format."""
+    names = [p[0] for p in vprops]
+    col = {name: i for i, name in enumerate(names)}
+    ncols = len(names)
+    name_set = set(names)
+
+    rows = []
+    read = 0
+    for line in f:
+        if not line.strip():
+            continue
+        rows.append(line)
+        read += 1
+        if read >= vcount:
+            break
+    if not rows:
+        raise PlyError("no vertex data found")
+
+    buf = b" ".join(r.strip() for r in rows)
+    flat = np.array(buf.split(), dtype=np.float64)
+    if flat.size < read * ncols:
+        raise PlyError("ASCII vertex data has fewer values than declared")
+    flat = flat[: read * ncols].reshape(read, ncols)
+
+    # Colour from SH DC
+    rgb = None
+    if "f_dc_0" in name_set and "f_dc_1" in name_set and "f_dc_2" in name_set:
+        dc0 = flat[:, col["f_dc_0"]]
+        dc1 = flat[:, col["f_dc_1"]]
+        dc2 = flat[:, col["f_dc_2"]]
+        rgb = _sh_dc_to_rgb(dc0, dc1, dc2)
+
+    # Opacity
+    opacity = None
+    if "opacity" in name_set:
+        raw_opacity = flat[:, col["opacity"]]
+        opacity = _sigmoid(raw_opacity).astype(np.float32)
+
+    # Scale
+    scale = None
+    if "scale_0" in name_set and "scale_1" in name_set and "scale_2" in name_set:
+        s0 = np.exp(flat[:, col["scale_0"]])
+        s1 = np.exp(flat[:, col["scale_1"]])
+        s2 = np.exp(flat[:, col["scale_2"]])
+        scale = ((s0 + s1 + s2) / 3.0).astype(np.float32)
+
+    return {"rgb": rgb, "opacity": opacity, "scale": scale}
 
 
 def _resolve_columns(vprops: list[tuple[str, str]]):

@@ -15,7 +15,8 @@ from .ply_io import read_ply
 
 
 class PlyLoader(QThread):
-    loaded = Signal(object, object, str, float)   # xyz, rgb, path, seconds
+    # xyz, rgb, path, seconds, opacity, scale, is_gaussian
+    loaded = Signal(object, object, str, float, object, object, bool)
     failed = Signal(str, str)                      # path, error message
 
     def __init__(self, path: str, max_points: int | None = None, parent=None):
@@ -31,4 +32,5 @@ class PlyLoader(QThread):
             self.failed.emit(self._path, str(e))
             return
         dt = time.time() - t0
-        self.loaded.emit(data.xyz, data.rgb, self._path, dt)
+        self.loaded.emit(data.xyz, data.rgb, self._path, dt,
+                         data.opacity, data.scale, data.is_gaussian)

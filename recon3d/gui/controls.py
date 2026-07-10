@@ -89,15 +89,13 @@ class ControlPanel(QWidget):
         self.bright.valueChanged.connect(viewer.set_brightness)
         form.addRow("亮度", self.bright)
 
-        self.shaded = QCheckBox("球体光照")
-        self.shaded.setChecked(viewer.shaded)
-        self.shaded.toggled.connect(viewer.set_shaded)
-        form.addRow(self.shaded)
+        self.quality_combo = QComboBox()
+        self.quality_combo.addItems(["高质量", "标准", "性能"])
+        # Map quality_level (2=high,1=std,0=perf) to combo index (0=high,1=std,2=perf)
+        self.quality_combo.setCurrentIndex(2 - viewer.quality_level)
+        self.quality_combo.currentIndexChanged.connect(self._on_quality_changed)
+        form.addRow("渲染质量", self.quality_combo)
 
-        self.fast = QCheckBox("性能模式（扁平点，更流畅）")
-        self.fast.setChecked(viewer.fast_mode)
-        self.fast.toggled.connect(self._on_fast_toggled)
-        form.addRow(self.fast)
         # the viewer reports the detected renderer once GL is up; reflect it
         viewer.rendererReady.connect(self._on_renderer_ready)
 
@@ -127,15 +125,16 @@ class ControlPanel(QWidget):
 
         root.addStretch(1)
 
-    def _on_fast_toggled(self, on: bool):
-        self._viewer.set_fast_mode(on)
+    def _on_quality_changed(self, index: int):
+        # combo index 0=高质量(2), 1=标准(1), 2=性能(0)
+        self._viewer.set_quality_level(2 - index)
 
     def _on_renderer_ready(self, is_software: bool):
-        # The viewer auto-enables fast mode on software renderers; reflect its
-        # actual state in the checkbox without re-triggering the toggle.
-        self.fast.blockSignals(True)
-        self.fast.setChecked(self._viewer.fast_mode)
-        self.fast.blockSignals(False)
+        # The viewer auto-enables performance mode on software renderers;
+        # reflect its actual state in the combo without re-triggering.
+        self.quality_combo.blockSignals(True)
+        self.quality_combo.setCurrentIndex(2 - self._viewer.quality_level)
+        self.quality_combo.blockSignals(False)
 
     def set_theme_list(self, names, current):
         self.theme_combo.blockSignals(True)

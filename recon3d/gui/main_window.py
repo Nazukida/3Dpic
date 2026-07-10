@@ -201,18 +201,20 @@ class MainWindow(QMainWindow):
         self._loader.failed.connect(self._on_ply_failed)
         self._loader.start()
 
-    def _on_ply_loaded(self, xyz, rgb, path, seconds):
+    def _on_ply_loaded(self, xyz, rgb, path, seconds, opacity, scale, is_gaussian):
         self._progress.setVisible(False)
-        self.viewer.set_cloud(xyz, rgb)
+        self.viewer.set_cloud(xyz, rgb, opacity=opacity, scale=scale)
         n = len(xyz)
         has_c = rgb is not None
         self.setWindowTitle(f"recon3d — {os.path.basename(path)}")
+        fmt_type = "3D Gaussian Splatting" if is_gaussian else ("RGB 彩色" if has_c else "高度着色")
         self.controls.set_stats(
             f"{os.path.basename(path)}\n{n:,} 个点\n"
-            f"{'RGB 彩色' if has_c else '高度着色'}\n"
+            f"{fmt_type}\n"
             f"加载耗时 {seconds:.2f} 秒")
         self._status_label.setText(
-            f"已从 {os.path.basename(path)} 加载 {n:,} 个点，耗时 {seconds:.2f} 秒")
+            f"已从 {os.path.basename(path)} 加载 {n:,} 个点，耗时 {seconds:.2f} 秒"
+            + (" [3DGS]" if is_gaussian else ""))
 
     def _on_ply_failed(self, path, msg):
         self._progress.setVisible(False)
