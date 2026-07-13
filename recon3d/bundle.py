@@ -2,7 +2,7 @@ from __future__ import annotations
 import cv2
 import numpy as np
 from scipy.optimize import least_squares
-from scipy.sparse import lil_matrix
+from scipy.sparse import csr_matrix
 
 from .scene import Reconstruction
 
@@ -124,21 +124,50 @@ class BundleProblem:
             res[np.repeat(behind, 2)] = 0.0
         return res
     
-    def jac_sparsity(self) ->lil_matrix:
-        m = len(self.cam_obs) * 2
+    def jac_sparsity(self) -> csr_matrix:
+        # Vectorized sparsity construction: compute all (row, col) pairs for
+        # non-zero Jacobian entries in one shot, then build a CSR matrix directly.
+        # Each observation i produces 2 residual rows (2*i, 2*i+1). Each row has
+        # non-zeros at 6 camera columns and 3 point columns (plus 1 focal column
+        # if refining focal length).
+        n_obs = len(self.cam_obs)
+        m = n_obs * 2
         n = self.n_cams * 6 + self.n_pts * 3 + (1 if self.refine_focal else 0)
-        A = lil_matrix((m, n), dtype=int)
-        i = np.arange(len(self.cam_obs))
-        for s in range(6):
-            A[2 * i, self.cam_obs * 6 + s] = 1
-            A[2 * i + 1, self.cam_obs * 6 + s] = 1
-        pt_base = self.n_cams * 6
-        for s in range(3):
-            A[2 * i, pt_base + self.pt_obs * 3 + s] = 1
-            A[2 * i + 1, pt_base + self.pt_obs * 3 + s] = 1
+
+        i = np.arange(n_obs)
+
+        # Camera parameter columns: 6 entries per observation row
+        cam_col_base = self.cam_obs * 6  # (n_obs,)
+        cam_cols = cam_col_base[:, None] + np.arange(6)[None, :]  # (n_obs, 6)
+
+        # Point parameter columns: 3 entries per observation row
+        pt_col_base = self.n_cams * 6 + self.pt_obs * 3  # (n_obs,)
+        pt_cols = pt_col_base[:, None] + np.arange(3)[None, :]  # (n_obs, 3)
+
+        # All columns for one residual row (9 per observation)
+        all_cols = np.hstack([cam_cols, pt_cols])  # (n_obs, 9)
+
+        # Each observation contributes to two residual rows (even and odd)
+        row_even = (2 * i)[:, None]  # (n_obs, 1)
+        row_odd = (2 * i + 1)[:, None]  # (n_obs, 1)
+
+        # Tile columns for both rows; build row indices to match
+        cols = np.tile(all_cols, (1, 1))  # reuse for both rows
+        rows_even = np.broadcast_to(row_even, (n_obs, 9))
+        rows_odd = np.broadcast_to(row_odd, (n_obs, 9))
+
+        row_indices = np.concatenate([rows_even.ravel(), rows_odd.ravel()])
+        col_indices = np.concatenate([cols.ravel(), cols.ravel()])
+
+        # Add focal length column: every residual row depends on it
         if self.refine_focal:
-            A[:, -1] = 1
-        return A
+            focal_rows = np.arange(m)
+            focal_cols = np.full(m, n - 1)
+            row_indices = np.concatenate([row_indices, focal_rows])
+            col_indices = np.concatenate([col_indices, focal_cols])
+
+        data = np.ones(len(row_indices), dtype=np.int8)
+        return csr_matrix((data, (row_indices, col_indices)), shape=(m, n))
     
 def run_bundle_adjustment(recon: Reconstruction, coords, refine_focal: bool = True,max_iters: int = 30, ftol: float = 1e-4, verbose: bool = False, log = print, label: str = "local") -> float:
     if len(recon.cameras) < 2 or len(recon.points) < 1:

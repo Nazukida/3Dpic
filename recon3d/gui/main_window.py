@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import os
 
+import numpy as np
+
 from PySide6.QtCore import Qt, QSettings
 from PySide6.QtGui import QAction, QKeySequence
 from PySide6.QtWidgets import (
@@ -21,6 +23,7 @@ from . import themes as T
 from .gl_viewer import GLViewer
 from .controls import ControlPanel
 from .loader import PlyLoader
+from .format_io import supported_formats, read_point_cloud, write_point_cloud, HAS_GAUSSFORGE
 from .theme_dialog import ThemeDialog
 
 
@@ -37,6 +40,8 @@ class MainWindow(QMainWindow):
         self._last_dir = self._settings.get("last_dir", os.path.expanduser("~"))
         self._loader: PlyLoader | None = None
         self._recon_panel = None
+        self._current_xyz: np.ndarray | None = None
+        self._current_rgb: np.ndarray | None = None
 
         # central viewer
         self.viewer = GLViewer(self, theme=self._current_theme())
@@ -71,10 +76,17 @@ class MainWindow(QMainWindow):
 
         # 文件
         m_file = mb.addMenu("文件(&F)")
-        act_open = QAction("打开 PLY…(&O)", self)
+        act_open = QAction("打开点云…(&O)", self)
         act_open.setShortcut(QKeySequence.Open)
-        act_open.triggered.connect(self.open_ply_dialog)
+        act_open.triggered.connect(self.open_file_dialog)
         m_file.addAction(act_open)
+
+        self._act_export = QAction("导出为…(&E)", self)
+        self._act_export.setShortcut(QKeySequence("Ctrl+Shift+S"))
+        self._act_export.triggered.connect(self._export_dialog)
+        self._act_export.setEnabled(False)
+        m_file.addAction(self._act_export)
+
         m_file.addSeparator()
         act_quit = QAction("退出(&X)", self)
         act_quit.setShortcut(QKeySequence.Quit)
@@ -173,10 +185,22 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------ #
     # PLY loading
     # ------------------------------------------------------------------ #
-    def open_ply_dialog(self):
+    def open_file_dialog(self):
+        exts = supported_formats()
+        # Build filter string: "点云文件 (*.ply *.splat ...);;PLY (*.ply);;..."
+        all_glob = " ".join(f"*{e}" for e in exts)
+        filters = [f"点云文件 ({all_glob})"]
+        filters.append("PLY 点云 (*.ply)")
+        if HAS_GAUSSFORGE:
+            filters.append("SPLAT (*.splat)")
+            filters.append("KSPLAT (*.ksplat)")
+            filters.append("SPZ (*.spz)")
+            filters.append("SOG (*.sog)")
+        filters.append("所有文件 (*)")
+        filter_str = ";;".join(filters)
+
         path, _ = QFileDialog.getOpenFileName(
-            self, "打开 PLY 点云", self._last_dir,
-            "PLY 点云 (*.ply);;所有文件 (*)")
+            self, "打开点云文件", self._last_dir, filter_str)
         if path:
             self.load_ply(path)
 
@@ -203,6 +227,9 @@ class MainWindow(QMainWindow):
 
     def _on_ply_loaded(self, xyz, rgb, path, seconds, opacity, scale, is_gaussian):
         self._progress.setVisible(False)
+        self._current_xyz = xyz
+        self._current_rgb = rgb
+        self._act_export.setEnabled(True)
         self.viewer.set_cloud(xyz, rgb, opacity=opacity, scale=scale)
         n = len(xyz)
         has_c = rgb is not None
@@ -250,16 +277,18 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------ #
     def dragEnterEvent(self, e):
         if e.mimeData().hasUrls():
+            exts = supported_formats()
             for u in e.mimeData().urls():
-                if u.toLocalFile().lower().endswith(".ply"):
+                if any(u.toLocalFile().lower().endswith(ext) for ext in exts):
                     e.acceptProposedAction()
                     return
         e.ignore()
 
     def dropEvent(self, e):
+        exts = supported_formats()
         for u in e.mimeData().urls():
             p = u.toLocalFile()
-            if p.lower().endswith(".ply"):
+            if any(p.lower().endswith(ext) for ext in exts):
                 self.load_ply(p)
                 break
 
@@ -270,6 +299,42 @@ class MainWindow(QMainWindow):
             "<p>纯 CPU 三维重建流程，配备高性能 OpenGL 点云查看器。</p>"
             "<p>旋转：左键拖动 &nbsp;•&nbsp; 平移：右键拖动 &nbsp;•&nbsp; "
             "缩放：滚轮 &nbsp;•&nbsp; 重置视角：F</p>")
+
+    # ------------------------------------------------------------------ #
+    # Export
+    # ------------------------------------------------------------------ #
+    def _export_dialog(self):
+        if self._current_xyz is None:
+            QMessageBox.information(self, "无数据", "当前没有已加载的点云可导出。")
+            return
+
+        filters = ["PLY 点云 (*.ply)"]
+        if HAS_GAUSSFORGE:
+            filters.append("SPLAT (*.splat)")
+            filters.append("KSPLAT (*.ksplat)")
+            filters.append("SPZ (*.spz)")
+            filters.append("SOG (*.sog)")
+        filters.append("所有文件 (*)")
+        filter_str = ";;".join(filters)
+
+        path, _ = QFileDialog.getSaveFileName(
+            self, "导出为…", self._last_dir, filter_str)
+        if not path:
+            return
+
+        self._status_label.setText(f"正在导出 {os.path.basename(path)}…")
+        try:
+            colors = self._current_rgb
+            if colors is None:
+                colors = np.full((len(self._current_xyz), 3), 180, dtype=np.uint8)
+            write_point_cloud(path, self._current_xyz, colors)
+            self._status_label.setText(f"已导出至 {os.path.basename(path)}")
+        except ImportError as e:
+            QMessageBox.warning(self, "格式不可用", str(e))
+            self._status_label.setText("导出失败")
+        except Exception as e:
+            QMessageBox.critical(self, "导出失败", f"无法写入：\n{path}\n\n{e}")
+            self._status_label.setText("导出失败")
 
     def closeEvent(self, e):
         try:

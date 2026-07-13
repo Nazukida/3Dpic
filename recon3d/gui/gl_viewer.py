@@ -35,16 +35,19 @@ from PySide6.QtOpenGL import (
 from PySide6.QtOpenGLWidgets import QOpenGLWidget
 
 # Platform-specific raw GL access for functions not in QOpenGLFunctions.
-# On Windows we use opengl32.dll directly; on other platforms we skip the
-# calls (graceful degradation — depth mask optimization is non-critical).
+# On Windows we use the system opengl32.dll directly — but ONLY when we're on
+# the real desktop backend. Under "software" the live context is Mesa's
+# opengl32sw.dll and under "angle" it's libGLESv2.dll; calling through the
+# system opengl32.dll then is a different library than the one backing the
+# context, which produces the noisy "Attempted to use GDI functions with a
+# non-opengl32.dll library" warnings (and is the wrong driver anyway). On
+# other platforms we skip the calls entirely (graceful degradation — the
+# depth-mask tweak is non-critical and only helps semi-transparent splats).
 _gl32 = None
 if sys.platform == "win32":
     import os as _os
     import ctypes
-    # Don't load opengl32.dll when ANGLE is active — calling GDI-based GL
-    # functions through it when the context is backed by DirectX produces
-    # harmless but noisy warnings.
-    if _os.environ.get("QT_OPENGL") != "angle":
+    if _os.environ.get("QT_OPENGL", "desktop") == "desktop":
         try:
             _gl32 = ctypes.windll.opengl32
         except Exception:
