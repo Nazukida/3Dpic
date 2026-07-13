@@ -11,106 +11,106 @@ import os
 import sys
 
 
-def _select_opengl_backend() -> None:
-    """Choose the best available OpenGL backend on Windows.
+def _probe_has_hardware_gl() -> bool:
+    """Return True if the primary display exposes an OpenGL pixel format
+    backed by a real hardware installable-client-driver (ICD).
 
-    Qt6 on Windows supports three backends (set via QT_OPENGL env var):
-      - "desktop"  — native OpenGL (fastest, needs a real GPU driver)
-      - "angle"    — translates OpenGL ES to DirectX (works on RDP / weak GPUs)
-      - "software" — Mesa llvmpipe CPU fallback (always works, slow)
+    Every Windows machine always exposes the "Microsoft GDI Generic" software
+    OpenGL 1.1 renderer; its pixel formats all carry ``PFD_GENERIC_FORMAT``.
+    Only a real GPU driver additionally registers *non-generic* (ICD) formats.
+    We need a non-generic, double-buffered, depth-capable format to obtain the
+    3.x core context our shaders require.
 
-    If the user hasn't forced a backend already, we try desktop first by
-    probing for a valid pixel format.  If that fails we fall back to ANGLE.
+    This enumerates formats directly (no GL context created), which is the
+    reliable signal. Probing via a dummy context is *not* reliable:
+    ``ChoosePixelFormat`` happily hands back a GDI-Generic 1.1 context even on
+    machines that have no ICD at all (e.g. WDDM-only GPUs), and
+    ``wglGetProcAddress`` returns NULL for the WGL ARB entry points from such a
+    context — both produce false "native GL works" results. A real top-level
+    window is used (not a message-only window): message-only windows only see
+    the GDI Generic formats even when an ICD is installed.
     """
-    if sys.platform != "win32":
-        return
-    if "QT_OPENGL" in os.environ:
-        return  # user override — respect it
-
-    # Probe: try to create an actual OpenGL rendering context. This catches
-    # cases where ChoosePixelFormat succeeds but wglCreateContext fails (e.g.
-    # RDP sessions, VMs without GPU passthrough, broken ICD drivers).
     import ctypes
     from ctypes import wintypes
 
     gdi32 = ctypes.windll.gdi32
     user32 = ctypes.windll.user32
-    try:
-        opengl32 = ctypes.windll.opengl32
-    except OSError:
-        os.environ["QT_OPENGL"] = "angle"
-        return
 
     class PIXELFORMATDESCRIPTOR(ctypes.Structure):
         _fields_ = [
-            ("nSize", wintypes.WORD),
-            ("nVersion", wintypes.WORD),
-            ("dwFlags", wintypes.DWORD),
-            ("iPixelType", wintypes.BYTE),
-            ("cColorBits", wintypes.BYTE),
-            ("cRedBits", wintypes.BYTE),
-            ("cRedShift", wintypes.BYTE),
-            ("cGreenBits", wintypes.BYTE),
-            ("cGreenShift", wintypes.BYTE),
-            ("cBlueBits", wintypes.BYTE),
-            ("cBlueShift", wintypes.BYTE),
-            ("cAlphaBits", wintypes.BYTE),
-            ("cAlphaShift", wintypes.BYTE),
-            ("cAccumBits", wintypes.BYTE),
-            ("cAccumRedBits", wintypes.BYTE),
-            ("cAccumGreenBits", wintypes.BYTE),
-            ("cAccumBlueBits", wintypes.BYTE),
-            ("cAccumAlphaBits", wintypes.BYTE),
-            ("cDepthBits", wintypes.BYTE),
-            ("cStencilBits", wintypes.BYTE),
-            ("cAuxBuffers", wintypes.BYTE),
-            ("iLayerType", wintypes.BYTE),
-            ("bReserved", wintypes.BYTE),
-            ("dwLayerMask", wintypes.DWORD),
-            ("dwVisibleMask", wintypes.DWORD),
-            ("dwDamageMask", wintypes.DWORD),
+            ("nSize", wintypes.WORD), ("nVersion", wintypes.WORD),
+            ("dwFlags", wintypes.DWORD), ("iPixelType", wintypes.BYTE),
+            ("cColorBits", wintypes.BYTE), ("cRedBits", wintypes.BYTE),
+            ("cRedShift", wintypes.BYTE), ("cGreenBits", wintypes.BYTE),
+            ("cGreenShift", wintypes.BYTE), ("cBlueBits", wintypes.BYTE),
+            ("cBlueShift", wintypes.BYTE), ("cAlphaBits", wintypes.BYTE),
+            ("cAlphaShift", wintypes.BYTE), ("cAccumBits", wintypes.BYTE),
+            ("cAccumRedBits", wintypes.BYTE), ("cAccumGreenBits", wintypes.BYTE),
+            ("cAccumBlueBits", wintypes.BYTE), ("cAccumAlphaBits", wintypes.BYTE),
+            ("cDepthBits", wintypes.BYTE), ("cStencilBits", wintypes.BYTE),
+            ("cAuxBuffers", wintypes.BYTE), ("iLayerType", wintypes.BYTE),
+            ("bReserved", wintypes.BYTE), ("dwLayerMask", wintypes.DWORD),
+            ("dwVisibleMask", wintypes.DWORD), ("dwDamageMask", wintypes.DWORD),
         ]
 
-    PFD_DRAW_TO_WINDOW = 0x00000004
-    PFD_SUPPORT_OPENGL = 0x00000020
     PFD_DOUBLEBUFFER = 0x00000001
+    PFD_SUPPORT_OPENGL = 0x00000020
+    PFD_GENERIC_FORMAT = 0x00000040
+    WS_POPUP = 0x80000000
 
-    # Create a temporary hidden window for the context probe.
-    HWND_MESSAGE = ctypes.c_void_p(-3)  # message-only window (invisible)
-    hwnd = user32.CreateWindowExW(
-        0, "STATIC", "", 0, 0, 0, 1, 1, HWND_MESSAGE, None, None, None
-    )
+    hwnd = user32.CreateWindowExW(0, "STATIC", "glprobe", WS_POPUP,
+                                  0, 0, 2, 2, None, None, None, None)
     if not hwnd:
-        os.environ["QT_OPENGL"] = "angle"
-        return
-
+        return True  # cannot probe; assume hardware (preserve prior default)
     hdc = user32.GetDC(hwnd)
     if not hdc:
         user32.DestroyWindow(hwnd)
-        os.environ["QT_OPENGL"] = "angle"
+        return True
+    try:
+        max_pf = gdi32.DescribePixelFormat(hdc, 1, 0, None) or 0
+        for i in range(1, max_pf + 1):
+            pfd = PIXELFORMATDESCRIPTOR()
+            pfd.nSize = ctypes.sizeof(PIXELFORMATDESCRIPTOR)
+            gdi32.DescribePixelFormat(hdc, i, ctypes.sizeof(PIXELFORMATDESCRIPTOR),
+                                      ctypes.byref(pfd))
+            if (pfd.dwFlags & PFD_SUPPORT_OPENGL
+                    and not (pfd.dwFlags & PFD_GENERIC_FORMAT)
+                    and (pfd.dwFlags & PFD_DOUBLEBUFFER)
+                    and pfd.cDepthBits >= 16):
+                return True
+        return False
+    finally:
+        user32.ReleaseDC(hwnd, hdc)
+        user32.DestroyWindow(hwnd)
+
+
+def _select_opengl_backend() -> None:
+    """Pick the Qt OpenGL backend (``QT_OPENGL`` env var) before Qt starts.
+
+    Three backends are possible on Windows:
+      - "desktop"  — native OpenGL via opengl32.dll. Needs a real GPU driver
+                     (an OpenGL ICD). Fastest.
+      - "angle"    — OpenGL ES translated to DirectX. Only works if ANGLE DLLs
+                     (libGLESv2.dll / libEGL.dll) are shipped alongside Qt —
+                     PySide6 wheels do NOT bundle them.
+      - "software" — Mesa llvmpipe via the bundled opengl32sw.dll. Always
+                     works, but CPU-bound.
+
+    Qt's default *dynamic* selection is unreliable on drivers without an
+    OpenGL ICD (some WDDM-only GPUs, RDP without GPU passthrough): it loads
+    opengl32sw.dll but then fails pixel-format negotiation, producing the
+    "Attempted to use GDI functions with a non-opengl32.dll library" /
+    "Unable find a suitable pixel format" / "Failed to create context" storm.
+    So we decide explicitly: a hardware ICD is present -> "desktop", otherwise
+    -> "software" (the only path that yields a real modern GL context here).
+    "angle" is never auto-selected (no DLLs shipped) but stays available as a
+    manual ``QT_OPENGL=angle`` override for environments that provide them.
+    """
+    if sys.platform != "win32":
         return
-
-    pfd = PIXELFORMATDESCRIPTOR()
-    pfd.nSize = ctypes.sizeof(PIXELFORMATDESCRIPTOR)
-    pfd.nVersion = 1
-    pfd.dwFlags = PFD_DRAW_TO_WINDOW | PFD_SUPPORT_OPENGL | PFD_DOUBLEBUFFER
-    pfd.iPixelType = 0  # PFD_TYPE_RGBA
-    pfd.cColorBits = 32
-    pfd.cDepthBits = 24
-
-    can_gl = False
-    pf = gdi32.ChoosePixelFormat(hdc, ctypes.byref(pfd))
-    if pf != 0 and gdi32.SetPixelFormat(hdc, pf, ctypes.byref(pfd)):
-        hglrc = opengl32.wglCreateContext(hdc)
-        if hglrc:
-            can_gl = True
-            opengl32.wglDeleteContext(hglrc)
-
-    user32.ReleaseDC(hwnd, hdc)
-    user32.DestroyWindow(hwnd)
-
-    if not can_gl:
-        os.environ["QT_OPENGL"] = "angle"
+    if "QT_OPENGL" in os.environ:
+        return  # user override — respect it
+    os.environ["QT_OPENGL"] = "desktop" if _probe_has_hardware_gl() else "software"
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -127,18 +127,30 @@ def main(argv: list[str] | None = None) -> int:
     from .gl_viewer import default_surface_format
     from .main_window import MainWindow
 
-    # When using ANGLE, request OpenGL ES 3.0 instead of desktop 3.3 Core.
-    if os.environ.get("QT_OPENGL") == "angle":
+    backend = os.environ.get("QT_OPENGL")
+    if backend == "software":
+        # Mesa llvmpipe (opengl32sw.dll) ships a desktop GL 3.0 context but is
+        # picky: pinning a 3.3-core profile OR requesting MSAA makes it fail
+        # pixel-format negotiation. Leave version & samples unset — we get a
+        # usable GL 3.0 context, and the viewer detects llvmpipe and switches
+        # to its fast software render path on its own.
+        fmt = QSurfaceFormat()
+        fmt.setDepthBufferSize(24)
+        fmt.setStencilBufferSize(8)
+        fmt.setSwapInterval(0)   # a CPU rasteriser gains nothing from vsync
+        QSurfaceFormat.setDefaultFormat(fmt)
+    elif backend == "angle":
+        # OpenGL ES via ANGLE (only when the user has supplied ANGLE DLLs).
         fmt = QSurfaceFormat()
         fmt.setRenderableType(QSurfaceFormat.OpenGLES)
         fmt.setVersion(3, 0)
         fmt.setDepthBufferSize(24)
         fmt.setStencilBufferSize(8)
-        fmt.setSamples(4)
         fmt.setSwapInterval(1)
         QSurfaceFormat.setDefaultFormat(fmt)
     else:
-        # Global default format so every QOpenGLWidget gets a 3.3 core + MSAA ctx.
+        # desktop — real GPU: global default so every QOpenGLWidget gets a
+        # 3.3 core + 8x MSAA context.
         QSurfaceFormat.setDefaultFormat(default_surface_format())
 
     app = QApplication(argv)

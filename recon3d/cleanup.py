@@ -70,7 +70,7 @@ def voxel_downsample(points: np.ndarray, colors = None, normals = None, voxel: f
 def decimal_points(points: np.ndarray, colors = None, normals = None, max_points: int = 1_500_000, log = None) -> tuple:
     _log = log or (lambda *a, **k: None)
     n = len(points)
-    if n <= max_points or n <= max_points:
+    if n <= max_points:
         return points, colors, normals
     target = int(max_points)
     pts = points

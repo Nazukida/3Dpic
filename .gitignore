@@ -23,3 +23,17 @@ dist/
 .vscode/
 .idea/
 *.swp
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Reconstruction outputs
+output/
+
+# Large binary artifacts
+/*.ply
+*.npz
+
+# Eggs directory
+.eggs/

@@ -8,7 +8,7 @@ import cv2
 import numpy as np
 from PIL import Image, ExifTags
 
-IMAGE_EXTS = ['.jpg', '.jpeg', '.png', '.tif', '.tiff', '.bmp', "webp"]
+IMAGE_EXTS = ['.jpg', '.jpeg', '.png', '.tif', '.tiff', '.bmp', ".webp"]
 
 @dataclass
 class ImageInfo:
