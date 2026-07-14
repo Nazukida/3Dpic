@@ -180,6 +180,11 @@ def read_ply(path: str, max_points: int | None = None) -> PlyData:
 
     ``max_points`` optionally caps the number of points via uniform striding
     (cheap, order-preserving) - useful as a guard for enormous files.
+
+    Binary bodies are read via a memory-mapped view (see :func:`_read_binary`)
+    so a 3.8M-vertex / 200-byte-record file never materialises its full ~750 MB
+    structured array in RAM — only the xyz/rgb/normals columns we keep are
+    allocated (~60 MB). ASCII falls back to a buffered read.
     """
     with open(path, "rb") as f:
         fmt, vcount, vprops, elements = _read_header(f)
@@ -197,7 +202,11 @@ def read_ply(path: str, max_points: int | None = None) -> PlyData:
         if is_ascii:
             xyz, rgb, nrm = _read_ascii(f, vcount, vprops)
         else:
-            xyz, rgb, nrm = _read_binary(f, vcount, vprops, big_endian)
+            # Byte offset of the vertex body within the file. The file handle
+            # is positioned there after skipping preceding elements.
+            vertex_offset = f.tell()
+            xyz, rgb, nrm = _read_binary(path, vertex_offset, vcount, vprops,
+                                         big_endian)
 
     # --- 3D Gaussian Splatting detection & conversion ---
     is_gaussian = _is_gaussian_splatting(vprops)
@@ -405,7 +414,17 @@ def _skip_element(f, count, eprops, is_ascii, big_endian):
                 f.seek(np.dtype(_PLY_TYPES.get(ptype, "f4")).itemsize, 1)
 
 
-def _read_binary(f, vcount, vprops, big_endian):
+def _read_binary(path: str, offset: int, vcount: int,
+                 vprops: list[tuple[str, str]], big_endian: bool):
+    """Decode a binary vertex body via a memory-mapped, copy-free view.
+
+    ``path``/``offset`` locate the first vertex record in the file. The body is
+    exposed as a structured ``np.memmap`` view (Windows allocation-granularity
+    handled by mapping the aligned base and slicing the view by ``delta``), so
+    the multi-hundred-MB structured array is **never allocated in RAM** — only
+    the xyz/rgb/normals columns we copy out are. Falls back to a plain
+    ``np.fromfile`` if memory-mapping is unavailable (e.g. on a pipe).
+    """
     if any(str(t).startswith("list") for _, t in vprops):
         # vertex element with a list property is pathological; fall back slow.
         raise PlyError("list properties in vertex element are not supported")
@@ -420,26 +439,36 @@ def _read_binary(f, vcount, vprops, big_endian):
         fields.append((name, order + base))
         ptype_by_name[name] = base
     dt = np.dtype(fields)
+    rec_size = dt.itemsize
 
-    data = np.fromfile(f, dtype=dt, count=vcount)
-    if len(data) < vcount:
-        # truncated file - use what we got rather than crashing
-        vcount = len(data)
+    data = _memmap_struct(path, dt, offset, vcount)
+    if data is None:
+        # mmap unavailable (unusual path/pipe): classic buffered read.
+        with open(path, "rb") as f:
+            f.seek(offset)
+            data = np.fromfile(f, dtype=dt, count=vcount)
+
+    got = len(data)
+    if got < vcount:
+        vcount = got  # truncated file - use what we got rather than crashing
 
     (xn, yn, zn), rgb_names, nrm_names = _resolve_columns(vprops)
+    # Copy the columns we keep out of the (memmap-backed) structured view into
+    # ordinary contiguous arrays. The assignment gathers strided data into a
+    # dense buffer, so the memmap pages are read once and then released.
     xyz = np.empty((vcount, 3), dtype=np.float32)
-    xyz[:, 0] = data[xn]
-    xyz[:, 1] = data[yn]
-    xyz[:, 2] = data[zn]
+    xyz[:, 0] = data[xn][:vcount]
+    xyz[:, 1] = data[yn][:vcount]
+    xyz[:, 2] = data[zn][:vcount]
 
     rgb = None
     if rgb_names:
         rn, gn, bn = rgb_names
         scale = _color_scale(ptype_by_name[rn])
         rgb = np.empty((vcount, 3), dtype=np.float32)
-        rgb[:, 0] = data[rn]
-        rgb[:, 1] = data[gn]
-        rgb[:, 2] = data[bn]
+        rgb[:, 0] = data[rn][:vcount]
+        rgb[:, 1] = data[gn][:vcount]
+        rgb[:, 2] = data[bn][:vcount]
         if scale != 1.0:
             rgb *= scale
         rgb = np.clip(rgb, 0, 255).astype(np.uint8)
@@ -448,11 +477,36 @@ def _read_binary(f, vcount, vprops, big_endian):
     if nrm_names:
         nxn, nyn, nzn = nrm_names
         nrm = np.empty((vcount, 3), dtype=np.float32)
-        nrm[:, 0] = data[nxn]
-        nrm[:, 1] = data[nyn]
-        nrm[:, 2] = data[nzn]
+        nrm[:, 0] = data[nxn][:vcount]
+        nrm[:, 1] = data[nyn][:vcount]
+        nrm[:, 2] = data[nzn][:vcount]
 
+    del data  # drop the memmap view; the returned arrays are independent copies
     return xyz, rgb, nrm
+
+
+def _memmap_struct(path: str, dt: np.dtype, offset: int, count: int):
+    """Return a read-only structured view of ``count`` records at ``offset``.
+
+    Windows requires mmap offsets to be a multiple of the allocation
+    granularity (64 KiB); a PLY header puts the vertex body at an arbitrary
+    byte offset, so we map the aligned base and create a strided ``np.ndarray``
+    view that starts ``delta`` bytes in. The view shares the mapped pages — no
+    copy of the body is made. Returns ``None`` if the file cannot be mapped.
+    """
+    import mmap
+    rec_size = dt.itemsize
+    try:
+        ag = getattr(mmap, "ALLOCATIONGRANULARITY", 65536) or 65536
+        base = (offset // ag) * ag
+        delta = offset - base
+        raw = np.memmap(path, dtype=np.uint8, mode="r", offset=base,
+                        shape=(delta + count * rec_size,))
+        # Zero-copy structured view starting delta bytes into the mapped region.
+        return np.ndarray((count,), dtype=dt, buffer=raw,
+                          offset=delta, strides=(rec_size,))
+    except (ValueError, OSError, BufferError):
+        return None
 
 
 def _read_ascii(f, vcount, vprops):

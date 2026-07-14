@@ -22,6 +22,8 @@ Interaction: LMB orbit, RMB/MMB pan, wheel zoom, ``F`` / double-click re-fits.
 from __future__ import annotations
 
 import sys
+import time
+
 import numpy as np
 
 from PySide6.QtCore import Qt, QTimer, QPoint, Signal
@@ -336,6 +338,26 @@ class GLViewer(QOpenGLWidget):
         self._idle_timer.setInterval(180)
         self._idle_timer.timeout.connect(self._on_idle)
 
+        # --- adaptive frame-rate-feedback LOD ---
+        # A single self-tuning controller picks how many of the shuffled points
+        # to draw each frame. It targets a *frame time*, not a fixed count:
+        #   - while dragging (interacting): ~33 ms  -> ~30 fps, smooth orbit
+        #   - once settled (idle):           a heavier one-shot budget so the
+        #     crispest affordable view appears without a long freeze.
+        # Because points are shuffled on upload, drawing a prefix is always a
+        # uniform random subsample, so fewer points still reads as the scene.
+        self._target_fps_ms = 33.0          # interactive frame-time target
+        self._static_target_ms = 300.0      # idle settle frame-time target
+        self._last_paint_ms = 0.0           # measured duration of last paintGL
+        # Exponentially-smoothed cost PER POINT (ms). Rendering cost is roughly
+        # linear in point count across our operating range (~0.7 µs/pt on
+        # llvmpipe), so once we know the per-point cost we can predict the
+        # point count that hits any target frame time directly — no feedback
+        # oscillation, converges in ~2 frames. Robust to jitter via the EMA.
+        self._cpp_ema = 0.0
+        self._adaptive_n = 0                # current adaptive draw count
+        self._refine_pending = False        # static-refinement pump active
+
         # --- theme ---
         from . import themes as _t
         self._theme = theme or _t.PRESETS[_t.DEFAULT_THEME]
@@ -449,6 +471,13 @@ class GLViewer(QOpenGLWidget):
         self._n_points = n
         self._pending_upload = True
 
+        # New cloud: reset the adaptive LOD controller so it re-tunes to this
+        # cloud's size and the current renderer's fill-rate.
+        self._adaptive_n = 0
+        self._last_paint_ms = 0.0
+        self._cpp_ema = 0.0
+        self._refine_pending = False
+
         self.reset_view()
         if self._gl_ready:
             self.update()
@@ -458,7 +487,14 @@ class GLViewer(QOpenGLWidget):
         self._target = QVector3D(*[float(v) for v in self._center])
         self._yaw = 0.6
         self._pitch = 0.5
-        self._dist = self._radius / max(np.tan(np.radians(self._fov * 0.5)), 1e-3) * 1.4
+        # Frame the cloud's bounding BOX (not its diagonal sphere) so it fills
+        # the viewport. The old `*1.4`-on-the-radius framing left the cloud as a
+        # small centred blob (~35% of the view); sizing the distance to the max
+        # axis extent makes the scene large enough to read. The 1.5x gives a
+        # little margin for the angled (yaw/pitch) silhouette.
+        extent = self._bbox_max - self._bbox_min
+        max_ext = float(np.max(extent)) if np.max(extent) > 0 else 1.0
+        self._dist = max_ext * 1.5
         if self._gl_ready:
             self.update()
 
@@ -523,16 +559,16 @@ class GLViewer(QOpenGLWidget):
         if self._soft:
             self.fast_mode = True
             self.quality_level = 0
-            # Tuned from measured llvmpipe fill-rate (~200k pts ≈ 150 ms/frame):
-            # ~120k while dragging targets ~90 ms/frame (>10 fps) for a smooth
-            # feel; ~800k at idle settles the crisp view in ~0.5 s instead of
-            # ~1 s. Points are shuffled on upload so a prefix is a uniform
-            # subsample — density still reads well.
-            self._interactive_budget = 120_000
-            self._static_budget = 800_000
+            # The adaptive LOD controller (see paintGL / _adaptive_draw_n)
+            # targets a frame *time*, so these are just hard ceilings, not the
+            # usual draw counts. Measured llvmpipe cost is ~0.7 µs/point, so the
+            # controller settles near ~45 k points while dragging (≈30 fps) and
+            # as many as fit in one ~300 ms settle frame at idle (~450 k).
+            self._interactive_budget = 150_000
+            self._static_budget = 1_500_000
             self._max_point_px = 10.0
         else:
-            self._interactive_budget = 2_000_000
+            self._interactive_budget = 8_000_000
             self._static_budget = 0             # 0 = draw everything at idle
             self._max_point_px = 48.0
 
@@ -637,17 +673,24 @@ class GLViewer(QOpenGLWidget):
         if not self._gl_ready:
             return
         from . import themes as _t
-        # ground grid on XZ plane sized to the cloud
+        # Ground grid on the XZ plane, seated at the cloud's floor (bbox min Y)
+        # so it reads as a floor beneath the scene instead of slicing through
+        # its middle (which hid it entirely for centred clouds).
         r = max(self._radius, 1.0)
         step = _nice_step(r / 5.0)
         n = 10
         gc = _t.rgb_floats(self._theme.view_grid)
+        gy = float(self._bbox_min[1])
+        cx = float(self._center[0])
+        cz = float(self._center[2])
         lines = []
         extent = step * n
         for i in range(-n, n + 1):
-            x = i * step
-            lines += [(-extent, 0, x, *gc), (extent, 0, x, *gc)]
-            lines += [(x, 0, -extent, *gc), (x, 0, extent, *gc)]
+            d = i * step
+            lines += [(cx - extent, gy, cz + d, *gc),
+                      (cx + extent, gy, cz + d, *gc)]
+            lines += [(cx + d, gy, cz - extent, *gc),
+                      (cx + d, gy, cz + extent, *gc)]
         grid = np.array(lines, dtype=np.float32)
         self._grid_count = len(grid)
         self._grid_vao.bind(); self._grid_vbo.bind()
@@ -660,15 +703,16 @@ class GLViewer(QOpenGLWidget):
         self._line_prog.release()
         self._grid_vbo.release(); self._grid_vao.release()
 
-        # axis gizmo (X red, Y green, Z blue), length ~ one grid step
+        # axis gizmo (X red, Y green, Z blue), seated at the grid origin on the
+        # cloud floor, length ~ two grid steps
         L = step * 2
         ax = _t.rgb_floats(self._theme.view_axis_x)
         ay = _t.rgb_floats(self._theme.view_axis_y)
         az = _t.rgb_floats(self._theme.view_axis_z)
         axis = np.array([
-            (0, 0, 0, *ax), (L, 0, 0, *ax),
-            (0, 0, 0, *ay), (0, L, 0, *ay),
-            (0, 0, 0, *az), (0, 0, L, *az),
+            (cx, gy, cz, *ax), (cx + L, gy, cz, *ax),
+            (cx, gy, cz, *ay), (cx, gy + L, cz, *ay),
+            (cx, gy, cz, *az), (cx, gy, cz + L, *az),
         ], dtype=np.float32)
         self._axis_vao.bind(); self._axis_vbo.bind()
         self._axis_vbo.allocate(axis.tobytes(), axis.nbytes)
@@ -721,6 +765,7 @@ class GLViewer(QOpenGLWidget):
         if self._pending_upload:
             self._upload_cloud()
 
+        paint_t0 = time.perf_counter()
         gl.glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
 
         # ---- background gradient (no depth) ----
@@ -763,17 +808,13 @@ class GLViewer(QOpenGLWidget):
         # ---- point cloud ----
         n_gpu = getattr(self, "_n_gpu", 0)
         if n_gpu > 0:
-            # Level of detail: because points are shuffled on upload, drawing a
-            # prefix is a uniform random subsample. Cap it while interacting AND
-            # (on software renderers) at idle too — fill-rate, not vertex count,
-            # is what makes a CPU rasteriser crawl.
-            draw_n = n_gpu
-            if self._interacting:
-                if self._interactive_budget and n_gpu > self._interactive_budget:
-                    draw_n = self._interactive_budget
-            else:
-                if self._static_budget and n_gpu > self._static_budget:
-                    draw_n = self._static_budget
+            # Adaptive level of detail. Points are shuffled on upload, so a
+            # prefix is always a uniform random subsample. The controller sizes
+            # that prefix to hit a target frame TIME: a tight one (~33 ms) while
+            # dragging so orbiting stays smooth, and a looser one (~300 ms) once
+            # idle so the crispest affordable view appears — neither a fixed
+            # point count. It self-tunes to whatever fill-rate this renderer has.
+            draw_n = self._adaptive_draw_n(n_gpu)
 
             # Fast mode draws flat OPAQUE squares, so blending (enabled for the
             # grid/axis lines above) must be off — it both wastes fill-rate and
@@ -829,16 +870,101 @@ class GLViewer(QOpenGLWidget):
 
             self._prog.release()
 
+            # Record this frame's cost and, when settled, keep pumping repaints
+            # until the adaptive count converges on the idle target — i.e. until
+            # a single frame grows expensive enough. This makes the crisp view
+            # appear progressively instead of one long freeze.
+            self._last_paint_ms = (time.perf_counter() - paint_t0) * 1000.0
+            # Update per-point cost EMA (cost is ~linear in count, so this is
+            # stable and lets us predict the budget for any frame-time target).
+            if draw_n > 0 and self._last_paint_ms > 0:
+                cpp = self._last_paint_ms / draw_n
+                if self._cpp_ema <= 0:
+                    self._cpp_ema = cpp
+                else:
+                    self._cpp_ema = 0.7 * self._cpp_ema + 0.3 * cpp
+            self._maybe_schedule_refine(n_gpu, draw_n)
+
         gl.glDisable(GL_BLEND)
 
     def _set_vec3(self, prog, name, v):
         prog.setUniformValue(name, QVector3D(float(v[0]), float(v[1]), float(v[2])))
 
     # ------------------------------------------------------------------ #
+    # Adaptive LOD
+    # ------------------------------------------------------------------ #
+    def _adaptive_draw_n(self, n_gpu: int) -> int:
+        """Pick how many points to draw this frame to hit a target frame time.
+
+        Rendering cost is ~linear in point count, so we keep an EMA of the cost
+        per point and predict the count directly: ``n = target_ms / cpp``.
+        While dragging the target is ~33 ms (smooth orbit); once idle it's a
+        looser ~300 ms so the densest affordable view settles in one tolerable
+        frame. Because points are shuffled on upload, any prefix is a uniform
+        subsample, so fewer points still reads as the whole scene.
+        """
+        if n_gpu <= 0:
+            self._adaptive_n = 0
+            return 0
+
+        interacting = self._interacting
+        target_ms = self._target_fps_ms if interacting else self._static_target_ms
+        ceiling = (self._interactive_budget if interacting
+                   else (self._static_budget or n_gpu))
+        ceiling = max(15000, min(ceiling, n_gpu))
+
+        if self._cpp_ema > 1e-6:
+            n = int(target_ms / self._cpp_ema)
+        else:
+            # pre-calibration: a sensible probe count (~1/8 of the cloud)
+            n = min(ceiling, max(30000, n_gpu // 8))
+
+        n = int(max(15000, min(n, ceiling)))
+        self._adaptive_n = n
+        return n
+
+    def _static_converged(self, n_gpu: int, draw_n: int) -> bool:
+        """Has the idle view settled? Stops the refine pump when true.
+
+        Converged once the predicted budget (from the per-point cost) matches
+        what we just drew — i.e. another frame wouldn't change the count. Also
+        stops at the floor, or when every point is drawn and that's affordable.
+        """
+        if draw_n <= 15000:
+            return True                              # pinned at floor; give up
+        if draw_n >= n_gpu:
+            # drew everything; done only if it fits the budget
+            return self._cpp_ema <= 0 or (n_gpu * self._cpp_ema) < self._static_target_ms * 1.1
+        if self._cpp_ema <= 0:
+            return False
+        predicted = int(self._static_target_ms / self._cpp_ema)
+        return abs(predicted - draw_n) < max(15000, draw_n * 0.08)
+
+    def _maybe_schedule_refine(self, n_gpu: int, draw_n: int):
+        """After an idle frame, keep refining toward the static target until the
+        frame time converges (in either direction). Guards against runaway."""
+        if self._interacting:
+            self._refine_pending = False
+            return
+        if self._static_converged(n_gpu, draw_n):
+            self._refine_pending = False
+            return
+        if self._refine_pending:
+            return
+        self._refine_pending = True
+        QTimer.singleShot(0, self._refine_step)
+
+    def _refine_step(self):
+        self._refine_pending = False
+        if not self._interacting and self._gl_ready:
+            self.update()
+
+    # ------------------------------------------------------------------ #
     # Interaction
     # ------------------------------------------------------------------ #
     def _begin_interaction(self):
         self._interacting = True
+        self._refine_pending = False
         self._idle_timer.start()
 
     def _on_idle(self):
