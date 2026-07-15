@@ -23,7 +23,8 @@ from . import themes as T
 from .gl_viewer import GLViewer
 from .controls import ControlPanel
 from .loader import PlyLoader
-from .format_io import supported_formats, read_point_cloud, write_point_cloud, HAS_GAUSSFORGE
+from .format_io import write_point_cloud, HAS_GAUSSFORGE
+from .model_io import format_groups, is_supported
 from .theme_dialog import ThemeDialog
 
 
@@ -186,21 +187,17 @@ class MainWindow(QMainWindow):
     # PLY loading
     # ------------------------------------------------------------------ #
     def open_file_dialog(self):
-        exts = supported_formats()
-        # Build filter string: "点云文件 (*.ply *.splat ...);;PLY (*.ply);;..."
-        all_glob = " ".join(f"*{e}" for e in exts)
-        filters = [f"点云文件 ({all_glob})"]
-        filters.append("PLY 点云 (*.ply)")
-        if HAS_GAUSSFORGE:
-            filters.append("SPLAT (*.splat)")
-            filters.append("KSPLAT (*.ksplat)")
-            filters.append("SPZ (*.spz)")
-            filters.append("SOG (*.sog)")
+        groups = format_groups()
+        all_exts = sorted({e for _, exts in groups for e in exts})
+        all_glob = " ".join(f"*{e}" for e in all_exts)
+        filters = [f"所有支持的模型 ({all_glob})"]
+        for label, exts in groups:
+            filters.append(f"{label} ({' '.join(f'*{e}' for e in exts)})")
         filters.append("所有文件 (*)")
         filter_str = ";;".join(filters)
 
         path, _ = QFileDialog.getOpenFileName(
-            self, "打开点云文件", self._last_dir, filter_str)
+            self, "打开模型文件", self._last_dir, filter_str)
         if path:
             self.load_ply(path)
 
@@ -225,7 +222,8 @@ class MainWindow(QMainWindow):
         self._loader.failed.connect(self._on_ply_failed)
         self._loader.start()
 
-    def _on_ply_loaded(self, xyz, rgb, path, seconds, opacity, scale, is_gaussian):
+    def _on_ply_loaded(self, xyz, rgb, path, seconds, opacity, scale,
+                       is_gaussian, source):
         self._progress.setVisible(False)
         self._current_xyz = xyz
         self._current_rgb = rgb
@@ -233,14 +231,14 @@ class MainWindow(QMainWindow):
         self.viewer.set_cloud(xyz, rgb, opacity=opacity, scale=scale)
         n = len(xyz)
         has_c = rgb is not None
-        self.setWindowTitle(f"recon3d — {os.path.basename(path)}")
+        self.setWindowTitle(f"recon3d — {os.path.basename(path)} [{source}]")
         fmt_type = "3D Gaussian Splatting" if is_gaussian else ("RGB 彩色" if has_c else "高度着色")
         self.controls.set_stats(
-            f"{os.path.basename(path)}\n{n:,} 个点\n"
+            f"{os.path.basename(path)}\n{source} • {n:,} 个点\n"
             f"{fmt_type}\n"
             f"加载耗时 {seconds:.2f} 秒")
         self._status_label.setText(
-            f"已从 {os.path.basename(path)} 加载 {n:,} 个点，耗时 {seconds:.2f} 秒"
+            f"已从 {os.path.basename(path)} 加载 {n:,} 个点（{source}），耗时 {seconds:.2f} 秒"
             + (" [3DGS]" if is_gaussian else ""))
 
     def _on_ply_failed(self, path, msg):
@@ -277,18 +275,16 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------ #
     def dragEnterEvent(self, e):
         if e.mimeData().hasUrls():
-            exts = supported_formats()
             for u in e.mimeData().urls():
-                if any(u.toLocalFile().lower().endswith(ext) for ext in exts):
+                if is_supported(u.toLocalFile()):
                     e.acceptProposedAction()
                     return
         e.ignore()
 
     def dropEvent(self, e):
-        exts = supported_formats()
         for u in e.mimeData().urls():
             p = u.toLocalFile()
-            if any(p.lower().endswith(ext) for ext in exts):
+            if is_supported(p):
                 self.load_ply(p)
                 break
 

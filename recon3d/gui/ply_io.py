@@ -43,7 +43,8 @@ class PlyData:
     count: int
     opacity: np.ndarray | None = None  # (N,) float32 in [0,1] or None
     scale: np.ndarray | None = None    # (N,) float32 (avg radius) or None
-    is_gaussian: bool = False          # True if loaded from a 3DGS PLY
+    is_gaussian: bool = False          # True if loaded from a 3DGS source
+    source: str = ""                   # detected format name (for UI status)
 
     @property
     def has_color(self) -> bool:

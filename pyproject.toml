@@ -15,6 +15,13 @@ dependencies = [
 
 [project.optional-dependencies]
 formats = ["gaussforge >= 0.3"]
+models = [
+    "torch >= 2.0",
+    "h5py >= 3.10",
+    "laspy >= 2.5",
+    "lazrs >= 0.6",
+    "trimesh >= 4.0",
+]
 
 [project.scripts]
 recon3d = "recon3d.run:main"
