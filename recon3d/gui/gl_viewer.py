@@ -312,8 +312,8 @@ class GLViewer(QOpenGLWidget):
         self._last_mouse = QPoint()
 
         # --- render options ---
-        self.point_size = 3.0
-        self.attenuation = 0.6          # 0..1
+        self.point_size = 2.0
+        self.attenuation = 0.0          # 0 = constant screen px (slider = px size); >0 adds perspective growth
         self.shaded = True
         self.show_grid = True
         self.show_axes = True
@@ -327,7 +327,8 @@ class GLViewer(QOpenGLWidget):
         self.fast_mode = False          # flat opaque square points, no blend
         self._interactive_budget = 2_000_000   # max points drawn while moving
         self._static_budget = 0                # max points at idle (0 = all)
-        self._max_point_px = 48.0
+        self._max_point_px = 12.0
+        self._true_extent = 1.0                # raw max axis extent (sizes the far plane)
         self._soft = False
         self._renderer_name = ""
 
@@ -406,11 +407,24 @@ class GLViewer(QOpenGLWidget):
                 self.update()
             return
 
-        # bounding box / centre / radius for framing
-        self._bbox_min = xyz.min(axis=0)
-        self._bbox_max = xyz.max(axis=0)
-        self._center = (self._bbox_min + self._bbox_max) * 0.5
-        self._radius = float(np.linalg.norm(self._bbox_max - self._bbox_min) * 0.5) or 1.0
+        # Bounding geometry for framing / grid / camera target. Use a ROBUST
+        # (0.5/99.5-percentile) box instead of the raw min/max: reconstructions
+        # routinely carry a few % of stray outlier points far outside the model
+        # body (e.g. dense.ply: 2.7% of points sit >2x beyond the body, inflating
+        # the raw box ~2.2x and shrinking the framed cloud to a centred blob you
+        # have to zoom into). The true extent is kept separately only to size
+        # the far clip plane so those outliers are never z-clipped.
+        true_min = xyz.min(axis=0)
+        true_max = xyz.max(axis=0)
+        self._true_extent = float(np.max(true_max - true_min)) or 1.0
+        lo = np.percentile(xyz, 0.5, axis=0)
+        hi = np.percentile(xyz, 99.5, axis=0)
+        if np.any(hi - lo <= 0):           # degenerate (flat / too few points)
+            lo, hi = true_min, true_max
+        self._bbox_min = lo
+        self._bbox_max = hi
+        self._center = (lo + hi) * 0.5
+        self._radius = float(np.linalg.norm(hi - lo) * 0.5) or 1.0
 
         # colours
         if rgb is not None and len(rgb) == n:
@@ -487,16 +501,49 @@ class GLViewer(QOpenGLWidget):
         self._target = QVector3D(*[float(v) for v in self._center])
         self._yaw = 0.6
         self._pitch = 0.5
-        # Frame the cloud's bounding BOX (not its diagonal sphere) so it fills
-        # the viewport. The old `*1.4`-on-the-radius framing left the cloud as a
-        # small centred blob (~35% of the view); sizing the distance to the max
-        # axis extent makes the scene large enough to read. The 1.5x gives a
-        # little margin for the angled (yaw/pitch) silhouette.
-        extent = self._bbox_max - self._bbox_min
-        max_ext = float(np.max(extent)) if np.max(extent) > 0 else 1.0
-        self._dist = max_ext * 1.5
+        # Frame the (robust) bounding box so it fills the viewport without
+        # clipping. _fit_distance projects the 8 box corners onto the camera
+        # right/up plane and sizes the distance so the larger projected extent
+        # maps to ~92% of the matching half-FOV — so the cloud fills the view
+        # regardless of its shape, and stray outlier points (excluded from the
+        # robust box in set_cloud) can't shrink the framed model.
+        self._dist = self._fit_distance(0.92)
         if self._gl_ready:
             self.update()
+
+    def _fit_distance(self, fill: float = 0.92) -> float:
+        """Camera distance so the bounding box fills ``fill`` of the viewport.
+
+        The 8 box corners are projected onto the camera's right/up plane; those
+        perpendicular components are independent of distance, so the distance is
+        sized directly: ``dist = max(perp_y/(fill*tan(fov/2)),
+        perp_x/(fill*tan(fov/2)*aspect))``. Taking the binding of the vertical
+        and horizontal fits keeps the whole box on screen (no clipping) at a
+        consistent fill fraction for any cloud shape.
+        """
+        half = (np.asarray(self._bbox_max, dtype=np.float64)
+                - np.asarray(self._bbox_min, dtype=np.float64)) * 0.5
+        cp, sp = np.cos(self._pitch), np.sin(self._pitch)
+        cy, sy = np.cos(self._yaw), np.sin(self._yaw)
+        d = np.array([cp * sy, sp, cp * cy], dtype=np.float64)
+        world_up = np.array([0.0, 1.0, 0.0])
+        right = np.cross(d, world_up)
+        right /= (np.linalg.norm(right) + 1e-12)
+        up = np.cross(right, d)
+        mx = my = 0.0
+        for sx in (-1.0, 1.0):
+            for syy in (-1.0, 1.0):
+                for sz in (-1.0, 1.0):
+                    c = np.array([sx * half[0], syy * half[1], sz * half[2]])
+                    mx = max(mx, abs(float(np.dot(c, right))))
+                    my = max(my, abs(float(np.dot(c, up))))
+        tan_h = np.tan(np.radians(self._fov) * 0.5)
+        w, h = self.width(), self.height()
+        aspect = (w / h) if (w > 0 and h > 0) else 1.0
+        dist_y = my / max(fill * tan_h, 1e-6)
+        dist_x = mx / max(fill * tan_h * aspect, 1e-6)
+        # floor: a degenerate (near-zero-extent) box must not collapse distance.
+        return float(max(dist_y, dist_x, float(self._radius) * 0.25))
 
     def set_point_size(self, v: float):
         self.point_size = float(v); self.update()
@@ -559,18 +606,21 @@ class GLViewer(QOpenGLWidget):
         if self._soft:
             self.fast_mode = True
             self.quality_level = 0
-            # The adaptive LOD controller (see paintGL / _adaptive_draw_n)
-            # targets a frame *time*, so these are just hard ceilings, not the
-            # usual draw counts. Measured llvmpipe cost is ~0.7 µs/point, so the
-            # controller settles near ~45 k points while dragging (≈30 fps) and
-            # as many as fit in one ~300 ms settle frame at idle (~450 k).
-            self._interactive_budget = 150_000
+            # The adaptive LOD controller (paintGL / _adaptive_draw_n) targets a
+            # frame *time*, so these are just hard ceilings. Default point
+            # sizing is constant screen-space (attenuation 0, point_size 2 ->
+            # 2 px splats): 2 px is ~25x cheaper to fill than the old 10 px, so
+            # the controller draws far more points per frame budget (~1 M while
+            # dragging, 1.5 M idle) — denser AND clearer, because small splats
+            # stop the cloud reading as one overdrawn blob. The time target
+            # still self-limits if the user raises the point size.
+            self._interactive_budget = 1_000_000
             self._static_budget = 1_500_000
-            self._max_point_px = 10.0
+            self._max_point_px = 6.0
         else:
             self._interactive_budget = 8_000_000
             self._static_budget = 0             # 0 = draw everything at idle
-            self._max_point_px = 48.0
+            self._max_point_px = 12.0
 
         try:
             self._prog = self._make_program(_POINT_VS, _POINT_FS)
@@ -745,7 +795,9 @@ class GLViewer(QOpenGLWidget):
         m = QMatrix4x4()
         aspect = self.width() / max(1, self.height())
         near = max(self._dist * 0.001, self._radius * 1e-3, 1e-4)
-        far = self._dist + self._radius * 4.0 + 10.0
+        # Far plane sized from the TRUE (not robust) extent so outlier points
+        # beyond the framed model body are still drawn, never z-clipped.
+        far = self._dist + self._true_extent * 2.5 + 10.0
         m.perspective(self._fov, aspect, near, far)
         return m
 
